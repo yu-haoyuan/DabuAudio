@@ -1,0 +1,5 @@
+pip install simplejson datasets==2.21.0 addict sortedcontainers
+pip install Pillow
+conda install -c conda-forge ffmpeg
+pip install soundfile
+pip install silero-vad

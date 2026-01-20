@@ -1,1 +1,4 @@
 data/*
+!data/*.md
+models/*
+!models/*.md

@@ -50,7 +50,7 @@ def process_audio_files(source_base_dir, output_base_dir):
 def main():
     # --- 路径配置区 ---
     CONFIG = {
-        "source_dir": "data",            # 假设你在当前根目录运行
+        "source_dir": "data/data_download",        
         "output_dir": "data/data_vanilla" # 明确避开这个输出目录
     }
 
