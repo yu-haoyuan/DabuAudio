@@ -48,10 +48,8 @@ class AudioProcessor:
         
         # Load ASR model
         print(f"Loading FunASR model from {self.model_path}...")
-        # Add model directory to sys.path to handle imports within the model code
         sys.path.append(str(self.model_path))
         
-        # Manually register FunASRNano if possible as requested by user instruction
         try:
             print("Attempting to register FunASRNano model...")
             from funasr.models.fun_asr_nano.model import FunASRNano
@@ -59,9 +57,7 @@ class AudioProcessor:
             print(f"Could not import FunASRNano directly: {e}")
             pass
 
-        # Try to import FunASRNano from the model directory
         print("Using funasr.AutoModel for Fun-ASR-Nano-2512...")
-        
         try:
             self.asr_model = AutoModel(
                 model=str(self.model_path),
@@ -76,151 +72,121 @@ class AudioProcessor:
 
     def process_vad(self, audio_path, speaker_id):
         wav = self.read_audio(str(audio_path), sampling_rate=self.sample_rate)
-        # Ensure wav is on the same device as the VAD model
         wav = wav.to(self.device)
         
-        # Calculate speech timestamps
-        # Aggressive splitting first, then we merge
+        # 1. Extract VAD segments
+        # Increased sensitivity to split fine segments: 
+        # min_silence_duration_ms=50 (aggressive split on silence)
+        # min_speech_duration_ms=50 (keep short words)
         speech_timestamps = self.get_speech_timestamps(
             wav, 
             self.vad_model, 
             sampling_rate=self.sample_rate,
-            threshold=0.3, # Lower threshold to catch more speech
-            min_speech_duration_ms=100, # Catch short utterances
-            min_silence_duration_ms=300 
+            threshold=0.4, # Slightly more sensitive to speech
+            min_speech_duration_ms=50, 
+            min_silence_duration_ms=50 
         )
         
-        # Load original audio for slicing/merging
+        # Load original audio for slicing
         audio = AudioSegment.from_wav(str(audio_path))
         original_filename = audio_path.stem
         
-        # Output structure: data_vadasr/speaker_id/original_filename/
-        # JSONL structure: data_vadasr/speaker_id/original_filename.jsonl
-        speaker_output_dir = self.output_dir / speaker_id / original_filename
+        # Output dir: data_vadasr/hxx_v2/original_filename/
+        target_speaker_dir_name = f"{speaker_id}_v2"
+        speaker_output_dir = self.output_dir / target_speaker_dir_name / original_filename
         speaker_output_dir.mkdir(parents=True, exist_ok=True)
         
-        generated_segments = []
-        
         if not speech_timestamps:
-            # If no speech detected, maybe process whole file if length matches target?
-            # Or just skip. User requirement implies we must process.
-            # If file is short (<10s), maybe just keep it as is?
-            if len(audio) < 10000:
-                 # Treat whole file as one segment
-                 speech_timestamps = [{'start': 0, 'end': int(len(audio) * 16)}] # samples
-            else:
-                 return []
+            return []
 
         # Convert samples to ms
         timestamps_ms = [{'start': t['start'] / self.sample_rate * 1000, 
                           'end': t['end'] / self.sample_rate * 1000} 
                          for t in speech_timestamps]
         
-        # Advanced merging logic with buffer/cache
-        final_segments = []
-        buffer_segment = None # {'start': ms, 'end': ms}
+        generated_segments = []
         
-        TARGET_MIN_DUR = 5000  # 5s
-        TARGET_MAX_DUR = 10000 # 10s
-        HARD_MAX_DUR = 15000   # 15s absolute max to force cut
+        # 2. Buffer splicing strategy
+        # Accumulate AUDIO CONTENT (skipping silence) until > 5s
         
-        for ts in timestamps_ms:
-            current_start = ts['start']
-            current_end = ts['end']
-            current_dur = current_end - current_start
-            
-            if buffer_segment is None:
-                buffer_segment = {'start': current_start, 'end': current_end}
-            else:
-                buffer_dur = buffer_segment['end'] - buffer_segment['start']
-                gap = current_start - buffer_segment['end']
-                combined_dur = buffer_dur + gap + current_dur
-                
-                # Check if merging makes sense
-                if combined_dur <= TARGET_MAX_DUR:
-                    # Merge it
-                    buffer_segment['end'] = current_end
-                elif buffer_dur < TARGET_MIN_DUR:
-                    # Buffer is too short, MUST merge even if it exceeds target slightly
-                    # unless it exceeds hard max
-                    if combined_dur < HARD_MAX_DUR:
-                        buffer_segment['end'] = current_end
-                    else:
-                        # Cannot merge without being too long.
-                        # Flush buffer (it's short but we have no choice or it was isolated)
-                        final_segments.append(buffer_segment)
-                        buffer_segment = {'start': current_start, 'end': current_end}
-                else:
-                    # Buffer is already good size, flush it
-                    final_segments.append(buffer_segment)
-                    buffer_segment = {'start': current_start, 'end': current_end}
+        buffer_audio = AudioSegment.empty()
+        buffer_start_ms = -1
+        buffer_end_ms = -1
         
-        # Flush remaining buffer
-        if buffer_segment:
-            final_segments.append(buffer_segment)
+        # Helper to flush buffer
+        def flush_buffer(buf_audio, start, end, segments_list):
+            if len(buf_audio) < 100: # Skip if empty or too short
+                return
             
-        # Second pass: check for any remaining tiny segments that could be merged backwards?
-        # The forward pass handles most.
-        # Check if any segment is < 0.5s and isolated?
-        # User said: "if < 0.5s and surrounding 10s is silence, add to cache..."
-        # My logic above merges across silence if resulting duration < 10s.
-        
-        for seg in final_segments:
-            start_ms = int(seg['start'])
-            end_ms = int(seg['end'])
-            duration = end_ms - start_ms
-            
-            if duration < 100: continue # Skip artifacts
-            
-            # Export segment
-            chunk = audio[start_ms:end_ms]
-            out_name = f"{original_filename}_{start_ms}_{end_ms}.wav"
+            out_name = f"{original_filename}_{int(start)}_{int(end)}.wav"
             out_path = speaker_output_dir / out_name
             
-            chunk.export(out_path, format="wav")
+            buf_audio.export(out_path, format="wav")
             
-            generated_segments.append({
+            segments_list.append({
                 'path': out_path,
-                'duration_ms': duration,
+                'duration_ms': len(buf_audio),
                 'original_file': original_filename,
-                'start_ms': start_ms,
-                'end_ms': end_ms,
-                'speaker_id': speaker_id
+                'start_ms': start, # Note: These are range markers, not continuous time in file
+                'end_ms': end,
+                'speaker_id': target_speaker_dir_name,
+                'jsonl_dir': speaker_output_dir # Store dir to save jsonl later
             })
+
+        for seg in timestamps_ms:
+            seg_start = seg['start']
+            seg_end = seg['end']
+            
+            # Cut the speech segment
+            chunk = audio[seg_start:seg_end]
+            
+            if buffer_start_ms == -1:
+                buffer_start_ms = seg_start
+            
+            buffer_audio += chunk
+            buffer_end_ms = seg_end # Update end marker
+            
+            if len(buffer_audio) >= 5000: # 5 seconds
+                flush_buffer(buffer_audio, buffer_start_ms, buffer_end_ms, generated_segments)
+                # Reset buffer
+                buffer_audio = AudioSegment.empty()
+                buffer_start_ms = -1
+                buffer_end_ms = -1
+                
+        # Flush remaining
+        if len(buffer_audio) > 0:
+             flush_buffer(buffer_audio, buffer_start_ms, buffer_end_ms, generated_segments)
             
         return generated_segments
 
     def run_asr(self, audio_path):
         if self.use_automodel:
-            # Optimize generation parameters
-            # use_cache=True, beam_size=1 (greedy), max_new_tokens=200
-            res = self.asr_model.generate(
-                input=[str(audio_path)],
-                batch_size=1,
-                language="中文",
-                itn=True,
-                use_cache=True,
-                max_new_tokens=256
-            )
-            # The result format from AutoModel depends on the model type
-            # For FunASR-Nano which is likely LLM-based (Qwen), it returns a list of dicts
-            # res[0] might contain 'text'
+            torch.cuda.empty_cache()
+            try:
+                res = self.asr_model.generate(
+                    input=[str(audio_path)],
+                    batch_size=1,
+                    language="中文",
+                    itn=True,
+                    use_cache=True,
+                    max_new_tokens=128
+                )
+            except torch.OutOfMemoryError:
+                 print(f"OOM encountered. Skipping ASR.")
+                 torch.cuda.empty_cache()
+                 return ""
+            
             if isinstance(res, list) and len(res) > 0:
                  if isinstance(res[0], dict) and "text" in res[0]:
                      return res[0]["text"]
                  return str(res[0])
             return str(res)
-        else:
-            # Using the FunASRNano interface provided by user
-            res = self.asr_m.inference(data_in=[str(audio_path)], **self.asr_kwargs)
-            return res[0][0]["text"]
+        return ""
 
     def run(self):
         extensions = {'.wav'}
         files_to_process = []
         
-        # Walk through input directory
-        # Input structure: data/data_denoise/speaker_id/file.wav
         for root, dirs, files in os.walk(self.input_dir):
             for file in files:
                 if Path(file).suffix.lower() in extensions:
@@ -228,19 +194,25 @@ class AudioProcessor:
         
         print(f"Found {len(files_to_process)} input files.")
         
-        # Step 1: VAD and Segmentation
-        print("Starting VAD segmentation...")
-        all_segments_map = {} # Map by (speaker_id, original_file) -> list of segments
+        print("Starting VAD segmentation and splicing...")
+        all_segments_map = {} # Map by (speaker_id_v2, original_filename, jsonl_dir) -> list of segments
         all_segments_flat = []
         
         for file_path in tqdm(files_to_process):
-            # Infer speaker_id from parent directory name
             speaker_id = file_path.parent.name
             original_filename = file_path.stem
             
             segments = self.process_vad(file_path, speaker_id)
             
-            key = (speaker_id, original_filename)
+            if not segments:
+                continue
+                
+            # Use the info from the first segment to identify the group
+            # Assuming all segments from one file go to the same output dir
+            jsonl_dir = segments[0]['jsonl_dir']
+            target_speaker_id = segments[0]['speaker_id']
+            
+            key = (target_speaker_id, original_filename, jsonl_dir)
             if key not in all_segments_map:
                 all_segments_map[key] = []
             all_segments_map[key].extend(segments)
@@ -250,24 +222,25 @@ class AudioProcessor:
             print("No segments generated.")
             return
 
-        # Calculate average duration
         total_duration = sum(seg['duration_ms'] for seg in all_segments_flat)
-        avg_duration = total_duration / len(all_segments_flat)
-        print(f"\nAverage segment duration: {avg_duration:.2f} ms ({avg_duration/1000:.2f} s)")
+        avg_duration = total_duration / len(all_segments_flat) if all_segments_flat else 0
+        print(f"\nAverage segment duration: {avg_duration:.2f} ms")
         print(f"Total segments: {len(all_segments_flat)}\n")
         
-        # Step 2: ASR
         print("Starting ASR transcription...")
         
-        # Output ASR results per original file: data_vadasr/speaker_id/original_filename.jsonl
-        for (speaker_id, original_filename), segments in all_segments_map.items():
+        # Output ASR results.
+        # process_vad creates: data_vadasr/hxx_v2/original_filename/xxx.wav
+        # User requested jsonl in: data_vadasr/hxx_v2/original_filename.jsonl (NOT inside original_filename dir)
+        
+        for (target_speaker_id, original_filename, jsonl_dir), segments in all_segments_map.items():
             jsonl_filename = f"{original_filename}.jsonl"
-            jsonl_output_path = self.output_dir / speaker_id / jsonl_filename
+            # jsonl_dir points to .../hxx_v2/original_filename/
+            # We want .../hxx_v2/
+            target_jsonl_dir = jsonl_dir.parent
+            jsonl_output_path = target_jsonl_dir / jsonl_filename
             
-            # Ensure dir exists (already created in VAD step, but good to be safe)
-            jsonl_output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            print(f"Processing {len(segments)} segments for {speaker_id}/{original_filename}...")
+            print(f"Processing {len(segments)} segments for {target_speaker_id}/{original_filename} -> {jsonl_output_path}")
             
             with open(jsonl_output_path, 'w', encoding='utf-8') as f:
                 for seg in tqdm(segments, leave=False):
@@ -287,7 +260,7 @@ class AudioProcessor:
         print(f"ASR completed. Results saved in {self.output_dir}")
 
 if __name__ == "__main__":
-    PROJECT_ROOT = "/data/yhy/code/DabuAudio"
+    PROJECT_ROOT = "/data/xiaobu/DabuAudio"
     INPUT_DIR = "data/data_denoise"
     OUTPUT_DIR = "data/data_vadasr"
     MODEL_PATH = "models/Fun-ASR-Nano-2512"
