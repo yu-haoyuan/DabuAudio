@@ -1,5 +1,9 @@
+conda create -n dabuaudio python=3.10
 pip install simplejson datasets==2.21.0 addict sortedcontainers
 pip install Pillow
 conda install -c conda-forge ffmpeg
 pip install soundfile
 pip install silero-vad
+pip install torchcodec
+pip install modelscope
+pip install addict

@@ -2,3 +2,4 @@ data/*
 !data/*.md
 models/*
 !models/*.md
+tool_spk/3D-Speaker
