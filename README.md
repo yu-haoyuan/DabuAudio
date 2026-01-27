@@ -1,3 +1,5 @@
 # DabuAudio
 
-pipeline of audio preprocess.
+cosyvoice
+
+qwen3tts
